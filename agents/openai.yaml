@@ -1,0 +1,4 @@
+interface:
+  display_name: "Amazon Competitor Monitor"
+  short_description: "Monitor Amazon competitor snapshots and push Feishu alerts."
+  default_prompt: "Use $amazon-competitor-monitor to run a one-off Amazon competitor monitoring job from pasted product links."
