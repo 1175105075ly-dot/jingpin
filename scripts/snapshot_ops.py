@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Utilities for Amazon competitor monitoring snapshots.
 
-The script intentionally avoids persisting user-pasted source URLs. Link
-normalization emits ASIN-based task records only.
+The script intentionally avoids persisting user-pasted source URLs in daily
+snapshots. Link normalization may keep collection URLs only in temporary task
+files so the current manual run can be crawled.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 
 SNAPSHOT_PREFIX = "竞品快照"
@@ -100,10 +101,23 @@ def split_link_text(text: str) -> list[str]:
     return parts
 
 
-def extract_asin(raw_url: str) -> str | None:
-    parsed = urlparse(raw_url if "://" in raw_url else f"https://{raw_url}")
+def normalize_url(raw_url: str) -> str:
+    return raw_url if "://" in raw_url else f"https://{raw_url}"
+
+
+def split_asin_filter(value: str) -> list[str]:
+    asins: list[str] = []
+    for candidate in re.split(r"(?:\||%7C)", value, flags=re.IGNORECASE):
+        cleaned = candidate.strip().upper()
+        if ASIN_RE.match(cleaned) and cleaned not in asins:
+            asins.append(cleaned)
+    return asins
+
+
+def extract_asins(raw_url: str) -> list[str]:
+    parsed = urlparse(normalize_url(raw_url))
     if not AMAZON_HOST_RE.search(parsed.netloc):
-        return None
+        return []
 
     path_parts = [p for p in parsed.path.split("/") if p]
     for marker in ("dp", "gp/product", "product-reviews"):
@@ -112,14 +126,32 @@ def extract_asin(raw_url: str) -> str | None:
             if [p.lower() for p in path_parts[idx : idx + len(marker_parts)]] == marker_parts:
                 next_idx = idx + len(marker_parts)
                 if next_idx < len(path_parts) and ASIN_RE.match(path_parts[next_idx]):
-                    return path_parts[next_idx].upper()
+                    return [path_parts[next_idx].upper()]
 
     query = parse_qs(parsed.query)
     for key in ("asin", "ASIN"):
         for value in query.get(key, []):
             if ASIN_RE.match(value):
-                return value.upper()
-    return None
+                return [value.upper()]
+
+    asins: list[str] = []
+    for rh in query.get("rh", []) + query.get("RH", []):
+        decoded = unquote(rh)
+        match = re.search(r"(?:^|,)p_78:([^,]+)", decoded)
+        if not match:
+            continue
+        for asin in split_asin_filter(match.group(1)):
+            if asin not in asins:
+                asins.append(asin)
+    return asins
+
+
+def is_collection_url(raw_url: str, asins: list[str]) -> bool:
+    if len(asins) <= 1:
+        return False
+    parsed = urlparse(normalize_url(raw_url))
+    query = parse_qs(parsed.query)
+    return bool(query.get("rh") or query.get("RH"))
 
 
 def canonical_url(asin: str, domain: str = "amazon.com") -> str:
@@ -130,20 +162,36 @@ def normalize_links(input_path: Path, output_path: Path, domain: str) -> dict[st
     seen: set[str] = set()
     valid: list[dict[str, str]] = []
     invalid: list[str] = []
+    crawl_pages: list[dict[str, Any]] = []
+
     for raw in split_link_text(read_text(input_path)):
-        asin = extract_asin(raw)
-        if not asin:
+        asins = extract_asins(raw)
+        if not asins:
             invalid.append(raw)
             continue
-        if asin in seen:
+
+        new_asins: list[str] = []
+        for asin in asins:
+            if asin in seen:
+                continue
+            seen.add(asin)
+            new_asins.append(asin)
+            valid.append({"asin": asin, "canonical_url": canonical_url(asin, domain)})
+
+        if not new_asins:
             continue
-        seen.add(asin)
-        valid.append({"asin": asin, "canonical_url": canonical_url(asin, domain)})
+
+        if is_collection_url(raw, asins):
+            crawl_pages.append({"url": normalize_url(raw), "expected_asins": new_asins})
+        else:
+            for asin in new_asins:
+                crawl_pages.append({"url": canonical_url(asin, domain), "expected_asins": [asin]})
 
     payload = {
         "created_at": utc_now_iso(),
         "count": len(valid),
         "tasks": valid,
+        "crawl_pages": crawl_pages,
         "invalid": invalid,
     }
     write_json(output_path, payload)
@@ -173,6 +221,8 @@ def coerce_records(data: Any) -> list[dict[str, Any]]:
         record.setdefault("scraped_at", utc_now_iso())
         record["scraped_at"] = record["scraped_at"] or utc_now_iso()
         record["status"] = record.get("status") or "ok"
+        record["error_type"] = record.get("error_type") or ""
+        record["error_message"] = record.get("error_message") or ""
         normalized.append(record)
     return sorted(normalized, key=lambda row: row["asin"])
 
@@ -299,32 +349,39 @@ def severity_for(changes: Iterable[dict[str, Any]]) -> str:
     return "info"
 
 
+def failed_records(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        row for row in records
+        if row.get("status") in {"failed", "unavailable", "invalid"} or row.get("error_type")
+    ]
+
+
 def compare_snapshots(old_path: Path, new_path: Path, out_path: Path, markdown_out: Path | None, thresholds: Thresholds) -> dict[str, Any]:
-    old_records = as_records_by_asin(read_json(old_path)) if old_path.exists() else {}
+    old_exists = old_path.exists()
+    old_records = as_records_by_asin(read_json(old_path)) if old_exists else {}
     new_records = as_records_by_asin(read_json(new_path))
     old_asins = set(old_records)
     new_asins = set(new_records)
     changed: list[dict[str, Any]] = []
 
-    for asin in sorted(old_asins | new_asins):
-        if asin not in old_records:
-            changed.append({"asin": asin, "severity": "info", "status": "new", "changes": [{"field": "asin", "old": None, "new": asin, "severity": "info", "reason": "new ASIN in today's run"}]})
-            continue
-        if asin not in new_records:
-            changed.append({"asin": asin, "severity": "critical", "status": "missing", "changes": [{"field": "asin", "old": asin, "new": None, "severity": "critical", "reason": "ASIN missing from today's snapshot"}]})
-            continue
-        changes = compare_pair(old_records[asin], new_records[asin], thresholds)
-        if changes:
-            changed.append({"asin": asin, "severity": severity_for(changes), "status": "changed", "changes": changes})
+    if old_exists:
+        for asin in sorted(old_asins | new_asins):
+            if asin not in old_records:
+                changed.append({"asin": asin, "severity": "info", "status": "new", "changes": [{"field": "asin", "old": None, "new": asin, "severity": "info", "reason": "new ASIN in today's run"}]})
+                continue
+            if asin not in new_records:
+                changed.append({"asin": asin, "severity": "critical", "status": "missing", "changes": [{"field": "asin", "old": asin, "new": None, "severity": "critical", "reason": "ASIN missing from today's snapshot"}]})
+                continue
+            changes = compare_pair(old_records[asin], new_records[asin], thresholds)
+            if changes:
+                changed.append({"asin": asin, "severity": severity_for(changes), "status": "changed", "changes": changes})
 
-    failed = [
-        row for row in new_records.values()
-        if row.get("status") in {"failed", "unavailable", "invalid"} or row.get("error_type")
-    ]
-    unchanged = sorted((old_asins & new_asins) - {item["asin"] for item in changed})
+    failed = failed_records(new_records.values())
+    unchanged = sorted((old_asins & new_asins) - {item["asin"] for item in changed}) if old_exists else sorted(new_asins)
     report = {
         "created_at": utc_now_iso(),
-        "old_snapshot": str(old_path),
+        "baseline": not old_exists,
+        "old_snapshot": str(old_path) if old_exists else "",
         "new_snapshot": str(new_path),
         "summary": {
             "old_count": len(old_records),
@@ -348,6 +405,7 @@ def write_markdown_report(path: Path, report: dict[str, Any]) -> None:
         f"# {REPORT_PREFIX}",
         "",
         f"- Created: {report['created_at']}",
+        f"- Baseline: {report.get('baseline', False)}",
         f"- Old count: {report['summary']['old_count']}",
         f"- New count: {report['summary']['new_count']}",
         f"- Changed: {report['summary']['changed_count']}",
@@ -356,16 +414,40 @@ def write_markdown_report(path: Path, report: dict[str, Any]) -> None:
         "",
         "## Changes",
     ]
+    if not report["changed"]:
+        lines.append("- None")
     for item in report["changed"]:
         lines.append(f"- {item['asin']} [{item['severity']}] {item['status']}")
         for change in item["changes"]:
             lines.append(f"  - {change['field']}: {change['old']} -> {change['new']} ({change['reason']})")
     lines.append("")
     lines.append("## Failed")
+    if not report["failed"]:
+        lines.append("- None")
     for item in report["failed"]:
         lines.append(f"- {item.get('asin')}: {item.get('error_type')} {item.get('error_message')}")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def validate_snapshot(snapshot_path: Path, expected_count: int | None, max_failed_rate: float) -> dict[str, Any]:
+    records = coerce_records(read_json(snapshot_path))
+    failed = failed_records(records)
+    count_ok = expected_count is None or len(records) == expected_count
+    failed_rate = (len(failed) / len(records)) if records else 1.0
+    ok = count_ok and failed_rate <= max_failed_rate
+    result = {
+        "ok": ok,
+        "record_count": len(records),
+        "expected_count": expected_count,
+        "count_ok": count_ok,
+        "failed_count": len(failed),
+        "failed_rate": failed_rate,
+        "max_failed_rate": max_failed_rate,
+    }
+    if not ok:
+        result["reason"] = "snapshot integrity check failed"
+    return result
 
 
 def rotate(active_dir: Path, archive_dir: Path, pending_dir: Path) -> dict[str, Any]:
@@ -417,6 +499,11 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--rating-drop-threshold", type=float, default=0.2)
     compare.add_argument("--review-count-threshold", type=int, default=10)
 
+    validate = sub.add_parser("validate-snapshot", help="Validate snapshot completeness before rotation")
+    validate.add_argument("--snapshot", required=True, type=Path)
+    validate.add_argument("--expected-count", type=int)
+    validate.add_argument("--max-failed-rate", type=float, default=0.25)
+
     rotate_cmd = sub.add_parser("rotate", help="Archive active snapshots and activate pending snapshots")
     rotate_cmd.add_argument("--active-dir", required=True, type=Path)
     rotate_cmd.add_argument("--archive-dir", required=True, type=Path)
@@ -441,6 +528,8 @@ def main() -> None:
             review_count=args.review_count_threshold,
         )
         result = compare_snapshots(args.old, args.new, args.out, args.markdown_out, thresholds)
+    elif args.command == "validate-snapshot":
+        result = validate_snapshot(args.snapshot, args.expected_count, args.max_failed_rate)
     elif args.command == "rotate":
         result = rotate(args.active_dir, args.archive_dir, args.pending_dir)
     else:
