@@ -6,6 +6,8 @@ Use one JSON object per ASIN. Keep key names stable so daily snapshots can be co
 
 Identity:
 - `asin`: required ASIN.
+- `resolved_asin`: final ASIN shown after navigation; normally equal to `asin` and empty when it cannot be verified.
+- `redirected_to_asin`: destination ASIN when Amazon redirects the requested ASIN; otherwise empty.
 - `scraped_at`: ISO-8601 timestamp for this ASIN.
 - `title`: product title.
 - `image_url`: main image URL.
@@ -52,8 +54,12 @@ Crawl status:
 - `error_type`: machine-readable error category, empty for successful records.
 - `error_message`: short human-readable error text.
 
+Use `status=invalid` and `error_type=asin_redirected` when `redirected_to_asin` differs from the requested `asin`. Never store destination-product metrics as if they belonged to the requested ASIN.
+
 ## Persistence Rules
 
 Do not store the user's original pasted URL. Store `asin` only; generate direct links as `https://www.amazon.com/dp/{asin}` when building Feishu cards or reports.
 
 Use empty strings for unavailable text fields, `null` for unavailable numeric/date fields, and booleans only where the source data can support a true/false value. If Seller Sprite times out, still emit a failed record with `asin`, `scraped_at`, `status`, `error_type`, and `error_message`.
+
+Successful records must provide `title`, `current_price`, `rating`, `small_bsr_rank`, and `main_category_rank` whenever Seller Sprite exposes them. Snapshot validation checks at least 90% coverage for each of these core fields across successful records.

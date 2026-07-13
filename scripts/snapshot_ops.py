@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urlparse, urlunparse
 
 
 SNAPSHOT_PREFIX = "竞品快照"
@@ -28,6 +28,8 @@ ASIN_RE = re.compile(r"^[A-Z0-9]{10}$", re.IGNORECASE)
 AMAZON_HOST_RE = re.compile(r"(^|\.)amazon\.", re.IGNORECASE)
 FIELD_ORDER = [
     "asin",
+    "resolved_asin",
+    "redirected_to_asin",
     "scraped_at",
     "status",
     "error_type",
@@ -67,6 +69,7 @@ class Thresholds:
     price_usd: float
     price_pct: float
     bsr_rank: int
+    bsr_pct: float
     rating_drop: float
     review_count: int
 
@@ -158,7 +161,40 @@ def canonical_url(asin: str, domain: str = "amazon.com") -> str:
     return f"https://www.{domain}/dp/{asin.upper()}"
 
 
-def normalize_links(input_path: Path, output_path: Path, domain: str) -> dict[str, Any]:
+def chunked(values: list[str], size: int) -> Iterable[list[str]]:
+    if size < 1:
+        raise ValueError("collection chunk size must be at least 1")
+    for start in range(0, len(values), size):
+        yield values[start : start + size]
+
+
+def collection_url_for_asins(raw_url: str, asins: list[str]) -> str:
+    parsed = urlparse(normalize_url(raw_url))
+    query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    replacement = "|".join(asins)
+    replaced = False
+    updated_pairs: list[tuple[str, str]] = []
+
+    for key, value in query_pairs:
+        if key.lower() == "rh" and not replaced:
+            value, count = re.subn(
+                r"((?:^|,)p_78:)[^,]+",
+                lambda match: f"{match.group(1)}{replacement}",
+                value,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+            replaced = count == 1
+        updated_pairs.append((key, value))
+
+    if not replaced:
+        raise ValueError("collection URL does not contain a replaceable p_78 ASIN filter")
+
+    query = urlencode(updated_pairs, doseq=True, safe="|:,")
+    return urlunparse(parsed._replace(query=query))
+
+
+def normalize_links(input_path: Path, output_path: Path, domain: str, collection_chunk_size: int) -> dict[str, Any]:
     seen: set[str] = set()
     valid: list[dict[str, str]] = []
     invalid: list[str] = []
@@ -182,14 +218,28 @@ def normalize_links(input_path: Path, output_path: Path, domain: str) -> dict[st
             continue
 
         if is_collection_url(raw, asins):
-            crawl_pages.append({"url": normalize_url(raw), "expected_asins": new_asins})
+            for asin_group in chunked(new_asins, collection_chunk_size):
+                crawl_pages.append(
+                    {
+                        "url": collection_url_for_asins(raw, asin_group),
+                        "expected_asins": asin_group,
+                        "page_type": "collection",
+                    }
+                )
         else:
             for asin in new_asins:
-                crawl_pages.append({"url": canonical_url(asin, domain), "expected_asins": [asin]})
+                crawl_pages.append(
+                    {
+                        "url": canonical_url(asin, domain),
+                        "expected_asins": [asin],
+                        "page_type": "detail",
+                    }
+                )
 
     payload = {
         "created_at": utc_now_iso(),
         "count": len(valid),
+        "collection_chunk_size": collection_chunk_size,
         "tasks": valid,
         "crawl_pages": crawl_pages,
         "invalid": invalid,
@@ -207,17 +257,26 @@ def coerce_records(data: Any) -> list[dict[str, Any]]:
         raise ValueError("records JSON must be a list or an object with a records list")
 
     normalized: list[dict[str, Any]] = []
+    seen_asins: set[str] = set()
     for item in records:
         if not isinstance(item, dict):
             raise ValueError("each record must be an object")
         asin = str(item.get("asin", "")).upper().strip()
         if not ASIN_RE.match(asin):
             raise ValueError(f"invalid ASIN in record: {asin!r}")
+        if asin in seen_asins:
+            raise ValueError(f"duplicate ASIN in records: {asin}")
+        seen_asins.add(asin)
         record = {field: item.get(field) for field in FIELD_ORDER}
         for key, value in item.items():
             if key not in record and key != "source_url":
                 record[key] = value
         record["asin"] = asin
+        for field in ("resolved_asin", "redirected_to_asin"):
+            value = str(record.get(field) or "").upper().strip()
+            if value and not ASIN_RE.match(value):
+                raise ValueError(f"invalid {field} in record {asin}: {value!r}")
+            record[field] = value
         record.setdefault("scraped_at", utc_now_iso())
         record["scraped_at"] = record["scraped_at"] or utc_now_iso()
         record["status"] = record.get("status") or "ok"
@@ -313,8 +372,14 @@ def compare_pair(old: dict[str, Any], new: dict[str, Any], thresholds: Threshold
         new_rank = to_int(new.get(field))
         if old_rank is not None and new_rank is not None and old_rank != new_rank:
             delta = new_rank - old_rank
-            severity = "critical" if abs(delta) >= thresholds.bsr_rank else "info"
-            add_change(changes, field, old_rank, new_rank, severity, "rank changed")
+            pct_delta = abs(pct_change(float(old_rank), float(new_rank)) or 0)
+            severity = (
+                "critical"
+                if field == "small_bsr_rank" and abs(delta) >= thresholds.bsr_rank and pct_delta >= thresholds.bsr_pct
+                else "info"
+            )
+            direction = "worsened" if delta > 0 else "improved"
+            add_change(changes, field, old_rank, new_rank, severity, f"rank {direction} ({pct_delta:.1f}%)")
 
     if old.get("is_out_of_stock") != new.get("is_out_of_stock"):
         add_change(changes, "is_out_of_stock", old.get("is_out_of_stock"), new.get("is_out_of_stock"), "critical", "stock status changed")
@@ -332,9 +397,14 @@ def compare_pair(old: dict[str, Any], new: dict[str, Any], thresholds: Threshold
     if old.get("new_negative_review_today") != new.get("new_negative_review_today") and new.get("new_negative_review_today"):
         add_change(changes, "new_negative_review_today", old.get("new_negative_review_today"), new.get("new_negative_review_today"), "critical", "new negative review marker")
 
-    for field in ("variant_count", "title", "image_url", "status", "error_type"):
+    for field in ("variant_count", "title", "image_url", "status", "error_type", "redirected_to_asin"):
         if old.get(field) != new.get(field):
-            severity = "critical" if field in ("status", "error_type") and new.get("status") != "ok" else "warning"
+            if field in ("status", "error_type", "redirected_to_asin"):
+                severity = "critical" if new.get("status") != "ok" else "warning"
+            elif field == "image_url":
+                severity = "info"
+            else:
+                severity = "warning"
             add_change(changes, field, old.get(field), new.get(field), severity, f"{field} changed")
 
     return changes
@@ -378,6 +448,9 @@ def compare_snapshots(old_path: Path, new_path: Path, out_path: Path, markdown_o
 
     failed = failed_records(new_records.values())
     unchanged = sorted((old_asins & new_asins) - {item["asin"] for item in changed}) if old_exists else sorted(new_asins)
+    critical_count = sum(item["severity"] == "critical" for item in changed)
+    warning_count = sum(item["severity"] == "warning" for item in changed)
+    info_only_count = sum(item["severity"] == "info" for item in changed)
     report = {
         "created_at": utc_now_iso(),
         "baseline": not old_exists,
@@ -387,6 +460,10 @@ def compare_snapshots(old_path: Path, new_path: Path, out_path: Path, markdown_o
             "old_count": len(old_records),
             "new_count": len(new_records),
             "changed_count": len(changed),
+            "material_changed_count": critical_count + warning_count,
+            "critical_count": critical_count,
+            "warning_count": warning_count,
+            "info_only_count": info_only_count,
             "unchanged_count": len(unchanged),
             "failed_count": len(failed),
         },
@@ -409,6 +486,10 @@ def write_markdown_report(path: Path, report: dict[str, Any]) -> None:
         f"- Old count: {report['summary']['old_count']}",
         f"- New count: {report['summary']['new_count']}",
         f"- Changed: {report['summary']['changed_count']}",
+        f"- Material changed: {report['summary'].get('material_changed_count', report['summary']['changed_count'])}",
+        f"- Critical: {report['summary'].get('critical_count', 0)}",
+        f"- Warning: {report['summary'].get('warning_count', 0)}",
+        f"- Info only: {report['summary'].get('info_only_count', 0)}",
         f"- Unchanged: {report['summary']['unchanged_count']}",
         f"- Failed: {report['summary']['failed_count']}",
         "",
@@ -430,48 +511,108 @@ def write_markdown_report(path: Path, report: dict[str, Any]) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def validate_snapshot(snapshot_path: Path, expected_count: int | None, max_failed_rate: float) -> dict[str, Any]:
-    records = coerce_records(read_json(snapshot_path))
+def expected_asins_from_tasks(tasks_path: Path | None) -> set[str] | None:
+    if tasks_path is None:
+        return None
+    payload = read_json(tasks_path)
+    tasks = payload.get("tasks", []) if isinstance(payload, dict) else []
+    return {str(item.get("asin", "")).upper() for item in tasks if isinstance(item, dict) and ASIN_RE.match(str(item.get("asin", "")))}
+
+
+def validate_snapshot(
+    snapshot_path: Path,
+    expected_count: int | None,
+    max_failed_rate: float,
+    expected_tasks: Path | None,
+    min_core_coverage: float,
+) -> dict[str, Any]:
+    try:
+        records = coerce_records(read_json(snapshot_path))
+    except (ValueError, KeyError, TypeError) as exc:
+        return {"ok": False, "reason": str(exc), "snapshot": str(snapshot_path)}
+
     failed = failed_records(records)
+    actual_asins = {row["asin"] for row in records}
+    expected_asins = expected_asins_from_tasks(expected_tasks)
     count_ok = expected_count is None or len(records) == expected_count
+    asin_set_ok = expected_asins is None or actual_asins == expected_asins
+    missing_asins = sorted((expected_asins or set()) - actual_asins)
+    unexpected_asins = sorted(actual_asins - (expected_asins or actual_asins))
     failed_rate = (len(failed) / len(records)) if records else 1.0
-    ok = count_ok and failed_rate <= max_failed_rate
+    ok_records = [row for row in records if row.get("status") == "ok" and not row.get("error_type")]
+    core_fields = ("title", "current_price", "rating", "small_bsr_rank", "main_category_rank")
+    core_coverage = {
+        field: (sum(row.get(field) not in (None, "") for row in ok_records) / len(ok_records)) if ok_records else 0.0
+        for field in core_fields
+    }
+    core_coverage_ok = bool(ok_records) and all(value >= min_core_coverage for value in core_coverage.values())
+    status_errors = [
+        row["asin"]
+        for row in records
+        if row.get("status") not in {"ok", "failed", "unavailable", "invalid"}
+        or (row.get("status") != "ok" and not row.get("error_type"))
+    ]
+    status_ok = not status_errors
+    ok = count_ok and asin_set_ok and failed_rate <= max_failed_rate and core_coverage_ok and status_ok
     result = {
         "ok": ok,
         "record_count": len(records),
         "expected_count": expected_count,
         "count_ok": count_ok,
+        "asin_set_ok": asin_set_ok,
+        "missing_asins": missing_asins,
+        "unexpected_asins": unexpected_asins,
         "failed_count": len(failed),
         "failed_rate": failed_rate,
         "max_failed_rate": max_failed_rate,
+        "core_coverage": core_coverage,
+        "min_core_coverage": min_core_coverage,
+        "core_coverage_ok": core_coverage_ok,
+        "status_ok": status_ok,
+        "status_errors": status_errors,
     }
     if not ok:
         result["reason"] = "snapshot integrity check failed"
     return result
 
 
-def rotate(active_dir: Path, archive_dir: Path, pending_dir: Path) -> dict[str, Any]:
+def rotate(active_dir: Path, archive_dir: Path, pending_dir: Path, date: str) -> dict[str, Any]:
     active_dir.mkdir(parents=True, exist_ok=True)
     archive_dir.mkdir(parents=True, exist_ok=True)
-    pending_files = sorted(pending_dir.glob(f"{SNAPSHOT_PREFIX}_*.json")) + sorted(pending_dir.glob(f"{SNAPSHOT_PREFIX}_*.csv"))
-    if not pending_files:
-        raise FileNotFoundError(f"no pending snapshot files found in {pending_dir}")
+    base = f"{SNAPSHOT_PREFIX}_{date}"
+    pending_files = [pending_dir / f"{base}.json", pending_dir / f"{base}.csv"]
+    missing = [str(path) for path in pending_files if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"pending snapshot pair is incomplete: {missing}")
 
     archived: list[str] = []
-    for existing in list(active_dir.glob(f"{SNAPSHOT_PREFIX}_*.json")) + list(active_dir.glob(f"{SNAPSHOT_PREFIX}_*.csv")):
-        target = archive_dir / existing.name
-        if target.exists():
-            target = archive_dir / f"{existing.stem}_{datetime.now().strftime('%H%M%S')}{existing.suffix}"
-        shutil.move(str(existing), str(target))
-        archived.append(str(target))
-
     activated: list[str] = []
-    for pending in pending_files:
-        target = active_dir / pending.name
-        shutil.move(str(pending), str(target))
-        activated.append(str(target))
+    archive_moves: list[tuple[Path, Path]] = []
+    activation_moves: list[tuple[Path, Path]] = []
+    try:
+        for existing in list(active_dir.glob(f"{SNAPSHOT_PREFIX}_*.json")) + list(active_dir.glob(f"{SNAPSHOT_PREFIX}_*.csv")):
+            target = archive_dir / existing.name
+            if target.exists():
+                target = archive_dir / f"{existing.stem}_{datetime.now().strftime('%H%M%S')}{existing.suffix}"
+            shutil.move(str(existing), str(target))
+            archive_moves.append((target, existing))
+            archived.append(str(target))
 
-    return {"archived": archived, "activated": activated}
+        for pending in pending_files:
+            target = active_dir / pending.name
+            shutil.move(str(pending), str(target))
+            activation_moves.append((target, pending))
+            activated.append(str(target))
+    except Exception:
+        for target, original in reversed(activation_moves):
+            if target.exists():
+                shutil.move(str(target), str(original))
+        for target, original in reversed(archive_moves):
+            if target.exists():
+                shutil.move(str(target), str(original))
+        raise
+
+    return {"date": date, "archived": archived, "activated": activated}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -482,6 +623,7 @@ def build_parser() -> argparse.ArgumentParser:
     normalize.add_argument("--input", required=True, type=Path)
     normalize.add_argument("--output", required=True, type=Path)
     normalize.add_argument("--domain", default="amazon.com")
+    normalize.add_argument("--collection-chunk-size", type=int, default=8)
 
     write = sub.add_parser("write-snapshot", help="Write pending JSON and CSV snapshot files")
     write.add_argument("--records", required=True, type=Path)
@@ -496,18 +638,22 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--price-usd-threshold", type=float, default=1.0)
     compare.add_argument("--price-pct-threshold", type=float, default=5.0)
     compare.add_argument("--bsr-rank-threshold", type=int, default=500)
+    compare.add_argument("--bsr-pct-threshold", type=float, default=20.0)
     compare.add_argument("--rating-drop-threshold", type=float, default=0.2)
     compare.add_argument("--review-count-threshold", type=int, default=10)
 
     validate = sub.add_parser("validate-snapshot", help="Validate snapshot completeness before rotation")
     validate.add_argument("--snapshot", required=True, type=Path)
     validate.add_argument("--expected-count", type=int)
+    validate.add_argument("--expected-tasks", type=Path)
     validate.add_argument("--max-failed-rate", type=float, default=0.25)
+    validate.add_argument("--min-core-coverage", type=float, default=0.9)
 
     rotate_cmd = sub.add_parser("rotate", help="Archive active snapshots and activate pending snapshots")
     rotate_cmd.add_argument("--active-dir", required=True, type=Path)
     rotate_cmd.add_argument("--archive-dir", required=True, type=Path)
     rotate_cmd.add_argument("--pending-dir", required=True, type=Path)
+    rotate_cmd.add_argument("--date", default=today_stamp())
     return parser
 
 
@@ -516,7 +662,7 @@ def main() -> None:
         sys.stdout.reconfigure(encoding="utf-8")
     args = build_parser().parse_args()
     if args.command == "normalize-links":
-        result = normalize_links(args.input, args.output, args.domain)
+        result = normalize_links(args.input, args.output, args.domain, args.collection_chunk_size)
     elif args.command == "write-snapshot":
         result = write_snapshot(args.records, args.pending_dir, args.date)
     elif args.command == "compare":
@@ -524,17 +670,26 @@ def main() -> None:
             price_usd=args.price_usd_threshold,
             price_pct=args.price_pct_threshold,
             bsr_rank=args.bsr_rank_threshold,
+            bsr_pct=args.bsr_pct_threshold,
             rating_drop=args.rating_drop_threshold,
             review_count=args.review_count_threshold,
         )
         result = compare_snapshots(args.old, args.new, args.out, args.markdown_out, thresholds)
     elif args.command == "validate-snapshot":
-        result = validate_snapshot(args.snapshot, args.expected_count, args.max_failed_rate)
+        result = validate_snapshot(
+            args.snapshot,
+            args.expected_count,
+            args.max_failed_rate,
+            args.expected_tasks,
+            args.min_core_coverage,
+        )
     elif args.command == "rotate":
-        result = rotate(args.active_dir, args.archive_dir, args.pending_dir)
+        result = rotate(args.active_dir, args.archive_dir, args.pending_dir, args.date)
     else:
         raise AssertionError(args.command)
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    if args.command == "validate-snapshot" and not result.get("ok"):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
